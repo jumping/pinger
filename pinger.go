@@ -80,7 +80,8 @@ func (p *Pinger) InUse(addr net.IP, timeout time.Duration) <-chan bool {
 				}
 				msgBytes, err := msg.Marshal(nil)
 				if err == nil {
-					if _, err := p.conn.WriteTo(msgBytes, tgtAddr); err != nil {
+					_, err := p.conn.WriteTo(msgBytes, tgtAddr)
+					if err != nil && !err.(net.Error).Temporary() {
 						return
 					}
 				}
@@ -96,12 +97,6 @@ func (p *Pinger) runTimeouts() ([]chan<- bool, bool) {
 	p.Lock()
 	defer p.Unlock()
 	res := []chan<- bool{}
-	if p.closed {
-		for _, v := range p.probes {
-			res = append(res, v...)
-		}
-		return res, false
-	}
 	cTime := time.Now()
 	toKill := []string{}
 	for k, v := range p.timeouts {
@@ -172,19 +167,38 @@ func (p *Pinger) mainLoop() {
 			p.Close()
 		}
 		n, peer, err := p.conn.ReadFrom(buf)
-		if err != nil {
-			chansToSend, valToSend = p.runTimeouts()
-		} else {
+		if err == nil {
+			// We recieved a message.  Process it.
 			chansToSend, valToSend = p.runMessage(peer, n, buf)
+		} else if err.(net.Error).Timeout() {
+			// Our read timed out.  Process the appropriate timeouts
+			chansToSend, valToSend = p.runTimeouts()
+		} else if err.(net.Error).Temporary() {
+			// Transient error, sleep a bit and try again.
+			time.Sleep(1 * time.Second)
+			continue
+		} else {
+			// Permanent error, we are done here
+			p.Lock()
+			p.conn.Close()
+			p.closed = true
+			toClose := []chan<- bool{}
+			for _, chList := range p.probes {
+				toClose = append(toClose, chList...)
+			}
+			p.probes = map[string][]chan<- bool{}
+			p.timeouts = map[string]time.Time{}
+			p.Unlock()
+			if len(toClose) > 0 {
+				for _, ch := range toClose {
+					close(ch)
+				}
+			}
+			return
 		}
 		for _, ch := range chansToSend {
-			if !p.closed {
-				ch <- valToSend
-			}
+			ch <- valToSend
 			close(ch)
-		}
-		if p.closed {
-			return
 		}
 	}
 }
