@@ -12,48 +12,59 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
-type Pinger struct {
-	sync.Mutex
-	closed   bool
-	probes   map[string][]chan<- bool
-	timeouts map[string]time.Time
-	conn     *icmp.PacketConn
+// Pinger tests to see if a system or service is alive and responding
+// to requests according to whatever metric makes the most sense for
+// the system or service.
+type Pinger interface {
+	// Close closes the Pinger, cancelling any outstanding InUse calls.
+	Close()
+	// InUse has the Pinger test to see if a system is alive within a
+	// specified timeframe.
+	//
+	// If the result channel yields true, the remote system or service
+	// responded to the request within the appropriate timeframe.  If
+	// the result channel yields false, either the remote system or
+	// service failed to respond within the specified time frame or we
+	// recieve positive confirmation that the system or service is not
+	// able to answer requests.
+	//
+	// You are not responsible for closing the returned channel, the
+	// Pinger will close it either after sending an appropriate response
+	// or if the Pinger is closed.  You must use the two-operand recieve
+	// operator to distinguish between the channel closing and the
+	// systrem or service not responding.
+	InUse(string, time.Duration) <-chan bool
 }
 
-func (p *Pinger) msgBody(addr string) []byte {
+type pinger struct {
+	*sync.Mutex
+	closed       bool
+	probes       map[string][]chan<- bool
+	timeouts     map[string]time.Time
+	conn4, conn6 *icmp.PacketConn
+}
+
+func (p *pinger) msgBody(addr string) []byte {
 	return []byte(fmt.Sprintf("Rebar DHCP Address Probe %s", addr))
 }
 
-// Close closes the Pinger.  It will close any open response channels,
-// terminate the main loop and any pinging routines, and close the
-// ICMP connection.
-func (p *Pinger) Close() {
+func (p *pinger) Close() {
 	p.Lock()
 	p.closed = true
-	p.conn.Close()
+	for _, probe := range p.probes {
+		for _, c := range probe {
+			close(c)
+		}
+	}
+	p.probes = nil
+	p.timeouts = nil
 	p.Unlock()
 }
 
-// InUse has the Pinger test to see if a system is alive within a specified timeframe.
-//
-// If the result channel yields true, the remote IP responded to an
-// ICMP echo request.  If the result channel yields false, either the
-// remote IP failed to respond to the echo requests within the
-// specified time frame or we recieved a Destination Unreachable
-// packet in response to one of our echo requests.
-//
-// No matter what the timeout is, InUse will only send up to 3 ICMP
-// echoo requests during the first 3 seconds after the InUse function
-// is called.
-//
-// You are not responsible for closing the returned channel, the
-// Pinger will close it either after sending an appropriate response
-// or if the Pinger is closed.  You must use the two-operand recieve
-// operator to distinguish between the channel closing and the address
-// not responding.
-func (p *Pinger) InUse(addr net.IP, timeout time.Duration) <-chan bool {
+func (p *pinger) InUse(ip string, timeout time.Duration) <-chan bool {
 	p.Lock()
 	defer p.Unlock()
 	res := make(chan bool)
@@ -61,7 +72,7 @@ func (p *Pinger) InUse(addr net.IP, timeout time.Duration) <-chan bool {
 		close(res)
 		return res
 	}
-	ip := addr.String()
+	addr := net.ParseIP(ip)
 	if probes, ok := p.probes[ip]; ok {
 		probes = append(probes, res)
 	} else {
@@ -71,16 +82,23 @@ func (p *Pinger) InUse(addr net.IP, timeout time.Duration) <-chan bool {
 				tgtAddr := &net.IPAddr{IP: addr}
 				msgBody := p.msgBody(tgtAddr.IP.String())
 				msg := icmp.Message{
-					Type: ipv4.ICMPTypeEcho,
 					Code: 0,
 					Body: &icmp.Echo{
 						Data: msgBody,
 						Seq:  i,
 					},
 				}
+				msg.Type = ipv6.ICMPTypeEchoRequest
+				if addr.To4() != nil {
+					msg.Type = ipv4.ICMPTypeEcho
+				}
 				msgBytes, err := msg.Marshal(nil)
 				if err == nil {
-					_, err := p.conn.WriteTo(msgBytes, tgtAddr)
+					if msg.Type == ipv4.ICMPTypeEcho {
+						_, err = p.conn4.WriteTo(msgBytes, tgtAddr)
+					} else {
+						_, err = p.conn4.WriteTo(msgBytes, tgtAddr)
+					}
 					if err != nil && !err.(net.Error).Temporary() {
 						return
 					}
@@ -93,7 +111,7 @@ func (p *Pinger) InUse(addr net.IP, timeout time.Duration) <-chan bool {
 	return res
 }
 
-func (p *Pinger) runTimeouts() ([]chan<- bool, bool) {
+func (p *pinger) runTimeouts() ([]chan<- bool, bool) {
 	p.Lock()
 	defer p.Unlock()
 	res := []chan<- bool{}
@@ -114,7 +132,7 @@ func (p *Pinger) runTimeouts() ([]chan<- bool, bool) {
 	return res, false
 }
 
-func (p *Pinger) runMessage(peer net.Addr, pktLen int, buf []byte) ([]chan<- bool, bool) {
+func (p *pinger) runMessage(peer net.Addr, pktLen int, buf []byte) ([]chan<- bool, bool) {
 	res := []chan<- bool{}
 	retVal := false
 	toKill := ""
@@ -128,7 +146,7 @@ func (p *Pinger) runMessage(peer net.Addr, pktLen int, buf []byte) ([]chan<- boo
 	p.Lock()
 	defer p.Unlock()
 	switch resp.Type {
-	case ipv4.ICMPTypeDestinationUnreachable:
+	case ipv4.ICMPTypeDestinationUnreachable, ipv6.ICMPTypeDestinationUnreachable:
 		// DestinationUnreachable will not come from our target, so we
 		// have to test its body against all our potential targets.
 		body, ok := resp.Body.(*icmp.DstUnreach)
@@ -142,7 +160,7 @@ func (p *Pinger) runMessage(peer net.Addr, pktLen int, buf []byte) ([]chan<- boo
 				}
 			}
 		}
-	case ipv4.ICMPTypeEchoReply:
+	case ipv4.ICMPTypeEchoReply, ipv6.ICMPTypeEchoReply:
 		_, ok := p.probes[tgtAddr]
 		if ok {
 			res = p.probes[tgtAddr]
@@ -157,16 +175,25 @@ func (p *Pinger) runMessage(peer net.Addr, pktLen int, buf []byte) ([]chan<- boo
 	return res, retVal
 }
 
-func (p *Pinger) mainLoop() {
+func (p *pinger) mainLoop(conn *icmp.PacketConn) {
 	buf := make([]byte, 1500)
 	for {
+		p.Lock()
+		if p.closed {
+			conn.Close()
+			p.Unlock()
+			return
+		}
+		p.Unlock()
+		err := conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		if err != nil {
+			conn.Close()
+			p.Close()
+			return
+		}
 		chansToSend := []chan<- bool{}
 		valToSend := false
-		err := p.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		if err != nil && !p.closed {
-			p.Close()
-		}
-		n, peer, err := p.conn.ReadFrom(buf)
+		n, peer, err := conn.ReadFrom(buf)
 		if err == nil {
 			// We recieved a message.  Process it.
 			chansToSend, valToSend = p.runMessage(peer, n, buf)
@@ -179,22 +206,8 @@ func (p *Pinger) mainLoop() {
 			continue
 		} else {
 			// Permanent error, we are done here
-			p.Lock()
-			p.conn.Close()
-			p.closed = true
-			toClose := []chan<- bool{}
-			for _, chList := range p.probes {
-				toClose = append(toClose, chList...)
-			}
-			p.probes = map[string][]chan<- bool{}
-			p.timeouts = map[string]time.Time{}
-			p.Unlock()
-			if len(toClose) > 0 {
-				for _, ch := range toClose {
-					close(ch)
-				}
-			}
-			return
+			p.Close()
+			continue
 		}
 		for _, ch := range chansToSend {
 			ch <- valToSend
@@ -203,23 +216,55 @@ func (p *Pinger) mainLoop() {
 	}
 }
 
-// New creates a new Pinger.  It will return an error if we are unable
-// to open a priveleged ICMPv4 packet socket or if we are not able to
-// set a read timeout on the socket, otherwise it will kick off the
-// main loop and return the new Pinger.
-func New() (*Pinger, error) {
-	res := &Pinger{
+// ICMP creates a new Pinger that tests system aliveness via ICMPv4 or
+// ICMPv6.  It will return an error if we are unable to open a
+// privileged ICMP packet sockets or if we are not able to set a read
+// timeout on the sockets.
+//
+// The InUse method on the Pinter returned by ICMP accepts raw IPv4 or
+// IPv6 addresses.
+func ICMP() (Pinger, error) {
+	res := &pinger{
+		Mutex:    &sync.Mutex{},
 		probes:   map[string][]chan<- bool{},
 		timeouts: map[string]time.Time{},
 	}
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	conn4, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		return nil, err
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+	if err := conn4.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
 		return nil, err
 	}
-	res.conn = conn
-	go res.mainLoop()
+	res.conn4 = conn4
+	go res.mainLoop(conn4)
+	conn6, err := icmp.ListenPacket("ip6:ipv6-icmp", "::")
+	if err != nil {
+		return nil, err
+	}
+	if err := conn6.SetReadDeadline(time.Now().Add(1 * time.Second)); err != nil {
+		return nil, err
+	}
+	res.conn6 = conn6
+	go res.mainLoop(conn6)
 	return res, nil
+}
+
+type fake bool
+
+func (f fake) Close() {}
+func (f fake) InUse(string, time.Duration) <-chan bool {
+	res := make(chan bool)
+	go func() {
+		res <- bool(f)
+		close(res)
+	}()
+	return res
+}
+
+// Fake returns a Pinger that always returns whatever is passed in for
+// ret.  It is intended for use in unit tests.
+func Fake(ret bool) Pinger {
+	return fake(ret)
+
 }
