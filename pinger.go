@@ -88,16 +88,18 @@ func (p *pinger) InUse(ip string, timeout time.Duration) <-chan bool {
 						Seq:  i,
 					},
 				}
-				msg.Type = ipv6.ICMPTypeEchoRequest
 				if addr.To4() != nil {
 					msg.Type = ipv4.ICMPTypeEcho
+				}else{
+					msg.Type = ipv6.ICMPTypeEchoRequest
 				}
+
 				msgBytes, err := msg.Marshal(nil)
 				if err == nil {
 					if msg.Type == ipv4.ICMPTypeEcho {
 						_, err = p.conn4.WriteTo(msgBytes, tgtAddr)
 					} else {
-						_, err = p.conn4.WriteTo(msgBytes, tgtAddr)
+						_, err = p.conn6.WriteTo(msgBytes, tgtAddr)
 					}
 					if err != nil && !err.(net.Error).Temporary() {
 						return
